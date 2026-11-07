@@ -1,12 +1,15 @@
-"""The thermostats, through their maker's web portal, driven with headless Chromium.
+"""Lennox iComfort thermostats, through the lennoxicomfort.com web portal, driven with headless Chromium.
 
-The iComfort M30 has no local API, and the maker's cloud API now answers only the maker's own app
-(lennoxs30api#101). The web portal still works, so this uses it as a person would: it logs in, opens a system's tile
-and reads the page. A change sends the page's own save call (UpdateScheduleConfig) through the page's jQuery, the way
-its sliders do, then opens the editor again to check that the portal kept it.
+The iComfort M30 has no local API, and Lennox's cloud API now answers only Lennox's own app (lennoxs30api#101). The
+web portal still works, so this uses it as a person would: it logs in, opens a system's tile and reads the page. A
+change sends the page's own save call (UpdateScheduleConfig) through the page's jQuery, the way its sliders do, then
+opens the editor again to check that the portal kept it.
 
 One browser session is kept between calls and used by one call at a time. The login is read from the secret store at
 each login and is never kept, logged or returned.
+
+Settings (under "lennox"): secret_command (a command that prints a secret given a reference, e.g. ["op", "read"]),
+username and password (the references for the portal login).
 """
 
 import asyncio
@@ -20,14 +23,17 @@ from playwright.async_api import Browser, Page, Playwright, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
+from mimir_climate.thermostats import ClimateError, find_period, kept, plan, system_names
+
 BASE = "https://www.lennoxicomfort.com"
 TILES = ".bxslider.HomeZones > *:not(.bx-clone)"
 WAIT_MS = 45_000
 NAV_MS = 90_000
 READ_BACK_WAITS = (2, 15, 30)  # seconds before each check that a change was kept
 PER_DAY = 4  # periods per day: ids 0-3 for "all days", or 0-27 for seven separate days
+START_STEP = 15  # the thermostat sets start times in quarter hours
 
-log = logging.getLogger("mimir_climate")
+log = logging.getLogger("mimir_climate.lennox")
 
 # A system's page, as text: "[heating|cooling] Feels Like [55%] 75 o <mode> [heat-to 72] [cool-to 80] …"
 STATUS = re.compile(
@@ -63,15 +69,18 @@ SAVE_JS = """(body) => new Promise(done => $.ajax({
 }).always((data, status) => done(status)))"""
 
 
-class PortalError(Exception):
-    """A failure the person can act on. The message is safe to show: it never holds the login."""
+def make(settings: dict[str, Any], names: Sequence[str]) -> "Lennox":
+    missing = [k for k in ("secret_command", "username", "password") if not settings.get(k)]
+    if missing:
+        raise SystemExit(f'set {", ".join(missing)} under "lennox" in settings.json')
+    return Lennox(settings["secret_command"], settings["username"], settings["password"], names)
 
 
 def parse_status(text: str) -> dict[str, Any]:
     """A system's page text to its state."""
     m = STATUS.search(" ".join(text.split()))
     if not m:
-        raise PortalError("could not read the system's page")
+        raise ClimateError("could not read the system's page")
     g = m.groupdict()
     return {
         "temperature": int(g["temp"]),
@@ -83,68 +92,19 @@ def parse_status(text: str) -> dict[str, Any]:
     }
 
 
-def check_setpoints(heat: int, cool: int, limits: dict[str, Any]) -> None:
-    """Refuse what the thermostat would refuse: setpoints out of range, or heat and cool too close together."""
-    for name, value in (("heat", heat), ("cool", cool)):
-        lo, hi = limits[name]
-        if not lo <= value <= hi:
-            raise PortalError(f"{name} {value} is outside {lo}-{hi}")
-    if cool - heat < limits["deadband"]:
-        raise PortalError(f"cool must be at least {limits['deadband']} above heat (asked heat {heat}, cool {cool})")
-
-
-TIME = re.compile(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?\s*$", re.IGNORECASE)
-
-
-def minutes(time: str) -> int:
-    """'07:00 am', '9:30 pm', '9:30pm', '21:30' or '8 am' to minutes after midnight."""
-    m = TIME.match(time)
-    if not m:
-        raise PortalError(f"could not read the time {time!r}; give it like 9:30 pm or 21:30")
-    hour, minute, half = int(m[1]), int(m[2] or 0), (m[3] or "").lower()
-    if minute > 59 or hour > 23 or (half and not 1 <= hour <= 12):
-        raise PortalError(f"{time!r} is not a time of day")
-    if half:
-        hour = hour % 12 + (12 if half == "p" else 0)
-    return hour * 60 + minute
-
-
 def portal_time(mins: int) -> str:
     """Minutes after midnight as the portal writes a start time: '09:30 pm'."""
     hour, minute = divmod(mins, 60)
     return f"{(hour % 12) or 12:02d}:{minute:02d} {'pm' if hour >= 12 else 'am'}"
 
 
-def check_start(start: str, period_id: int, periods: list[dict[str, Any]]) -> str:
-    """A new start time in the portal's form. Refused unless it is on a quarter hour (as the thermostat sets them)
-    and stays after the period before it and before the period after it (the periods run in order through the day)."""
-    mins = minutes(start)
-    if mins % 15:
-        raise PortalError("start times go in steps of 15 minutes (:00, :15, :30, :45)")
-    day = period_id // PER_DAY  # neighbours only within the same day
-    order = sorted((p for p in periods if p["period_id"] // PER_DAY == day), key=lambda p: p["period_id"])
-    i = next(i for i, p in enumerate(order) if p["period_id"] == period_id)
-    if i > 0 and mins <= minutes(order[i - 1]["start"]):
-        raise PortalError(f"must start after the period before it ({order[i - 1]['start']})")
-    if i + 1 < len(order) and mins >= minutes(order[i + 1]["start"]):
-        raise PortalError(f"must start before the period after it ({order[i + 1]['start']})")
-    return portal_time(mins)
+def with_days(editor: dict[str, Any]) -> dict[str, Any]:
+    """The editor's read, in the shared form: each period's day and slot, and the start step."""
+    periods = [p | {"day": p["period_id"] // PER_DAY, "slot": p["period_id"] % PER_DAY} for p in editor["periods"]]
+    return editor | {"periods": periods, "limits": editor["limits"] | {"start_step": START_STEP}}
 
 
-def system_names(count: int, names: Sequence[str]) -> list[str]:
-    """The portal's tiles in order, named from the settings ("system 3" for a tile without a name)."""
-    return [names[i] if i < len(names) else f"system {i + 1}" for i in range(count)]
-
-
-def find_period(schedule: dict[str, Any], period_id: int) -> dict[str, Any]:
-    for p in schedule["periods"]:
-        if p["period_id"] == period_id:
-            return p
-    ids = ", ".join(str(p["period_id"]) for p in schedule["periods"])
-    raise PortalError(f"no period {period_id}; the periods are {ids}")
-
-
-class Portal:
+class Lennox:
     def __init__(self, secret_command: Sequence[str], username_ref: str, password_ref: str, names: Sequence[str]):
         self._secret = list(secret_command)
         self._refs = (username_ref, password_ref)
@@ -154,7 +114,7 @@ class Portal:
         self._browser: Browser | None = None
         self._page: Page | None = None
 
-    # -- the tools' calls -------------------------------------------------------------------------------------
+    # -- the shared calls -------------------------------------------------------------------------------------
 
     async def status(self) -> list[dict[str, Any]]:
         return await self._run(self._status)
@@ -205,15 +165,15 @@ class Portal:
                         str(e).splitlines()[0][:200] if str(e) else type(e).__name__,
                     )
                     await self.close()  # start clean
-            raise PortalError("the portal did not answer as expected; try again in a few minutes")
+            raise ClimateError("the Lennox portal did not answer as expected; try again in a few minutes")
 
     def _read_secret(self, ref: str) -> str:
         try:
             out = subprocess.run([*self._secret, ref], capture_output=True, text=True, check=True, timeout=60)
         except (OSError, subprocess.SubprocessError):
-            raise PortalError("could not read the portal login from the secret store") from None
+            raise ClimateError("could not read the Lennox login from the secret store") from None
         if not out.stdout.strip():
-            raise PortalError("the secret store gave an empty portal login")
+            raise ClimateError("the secret store gave an empty Lennox login")
         return out.stdout.strip()
 
     async def _login(self, pg: Page) -> None:
@@ -239,15 +199,15 @@ class Portal:
                 return system_names(await pg.locator(TILES).count(), self._names)
             except PlaywrightTimeout:
                 if "/Account/Login" in pg.url:
-                    raise PortalError("the portal refused the login; check it in the secret store") from None
+                    raise ClimateError("the Lennox portal refused the login; check it in the secret store") from None
                 await pg.reload(wait_until="domcontentloaded")
-        raise PortalError("the portal did not show the systems; try again in a few minutes")
+        raise ClimateError("the Lennox portal did not show the systems; try again in a few minutes")
 
     async def _open_system(self, pg: Page, system: str) -> str:
         """Opens a system's page (the portal then acts on that system); its text."""
         names = await self._home(pg)
         if system not in names:
-            raise PortalError(f"no system {system!r}; the systems are {', '.join(names)}")
+            raise ClimateError(f"no system {system!r}; the systems are {', '.join(names)}")
         await pg.locator(TILES).nth(names.index(system)).locator("a").first.click()
         await pg.wait_for_url("**/Dashboard/HomeDetails**", timeout=WAIT_MS)
         await pg.wait_for_function(  # the body is briefly missing while the page swaps
@@ -262,9 +222,9 @@ class Portal:
         menu = pg.get_by_text("modes / schedules").locator("visible=true")
         if await menu.count() == 0:
             mode = parse_status(text)["mode"]
-            raise PortalError(
+            raise ClimateError(
                 f"{system} is in {mode}: the portal hides its schedules until that ends "
-                "(end it on the thermostat or in the maker's app)"
+                "(end it on the thermostat or in the Lennox app)"
             )
         await menu.first.click()
         await pg.wait_for_load_state("networkidle")
@@ -273,7 +233,7 @@ class Portal:
         await pg.get_by_text("edit schedules").locator("visible=true").first.click()
         await pg.wait_for_selector("td.slider", timeout=WAIT_MS)
         await asyncio.sleep(1)
-        return await pg.evaluate(SCHEDULE_JS)
+        return with_days(await pg.evaluate(SCHEDULE_JS))
 
     # -- the work ---------------------------------------------------------------------------------------------
 
@@ -284,7 +244,9 @@ class Portal:
         return out
 
     async def _schedule(self, pg: Page, system: str) -> dict[str, Any]:
-        return {"system": system} | await self._open_editor(pg, system)
+        editor = await self._open_editor(pg, system)
+        editor.pop("schedule_id")
+        return {"system": system} | editor
 
     async def _set_period(
         self,
@@ -297,26 +259,18 @@ class Portal:
         every_day: bool = False,
     ) -> dict[str, Any]:
         before = await self._open_editor(pg, system)
-        find_period(before, period_id)
-        targets = (
-            [p["period_id"] for p in before["periods"] if p["period_id"] % PER_DAY == period_id % PER_DAY]
-            if every_day
-            else [period_id]
-        )
-        wanted, saves = {}, []
-        for pid in targets:  # check every period first: nothing is sent unless all of them fit
-            was = find_period(before, pid)
-            h = was["heat"] if heat is None else heat
-            c = was["cool"] if cool is None else cool
-            check_setpoints(h, c, before["limits"])
-            s = was["start"] if start is None else check_start(start, pid, before["periods"])
-            wanted[pid] = (minutes(s), h, c)
-            if minutes(s) != minutes(was["start"]):
-                saves.append({"periodID": pid, "isStartTimeUpdated": True, "startTime": s})
-            if (h, c) != (was["heat"], was["cool"]):
-                saves.append({"periodID": pid, "isSetPointsUpdated": True, "csp": c, "hsp": h, "isSSPOn": False})
+        items = plan(before, period_id, heat, cool, start, every_day)
         out = {"system": system, "schedule": before["schedule"], "days": before["days"]}
-        out["before"] = [find_period(before, pid) for pid in targets]
+        out["before"] = [i["period"] for i in items]
+        saves = []
+        for i in items:
+            pid = i["period"]["period_id"]
+            if i["start_changed"]:
+                saves.append({"periodID": pid, "isStartTimeUpdated": True, "startTime": portal_time(i["start"])})
+            if i["set_changed"]:
+                saves.append(
+                    {"periodID": pid, "isSetPointsUpdated": True, "csp": i["cool"], "hsp": i["heat"], "isSSPOn": False}
+                )
         if not saves:
             return out | {"periods": out.pop("before"), "changed": False}
         for change in saves:
@@ -327,15 +281,15 @@ class Portal:
                 "CurrentDaysMode": before["days"],
             }
             if await pg.evaluate(SAVE_JS, body) != "success":
-                raise PortalError("the portal refused the change")
+                raise ClimateError("the Lennox portal refused the change")
         for wait in READ_BACK_WAITS:  # read back on a fresh page; the portal can take a little while to show it
             await asyncio.sleep(wait)
             after = await self._open_editor(pg, system)
-            now = [find_period(after, pid) for pid in targets]
-            if all((minutes(p["start"]), p["heat"], p["cool"]) == wanted[p["period_id"]] for p in now):
+            now = [find_period(after, i["period"]["period_id"]) for i in items]
+            if all(kept(i, n) for i, n in zip(items, now)):
                 break
         else:
-            off = [p for p in now if (minutes(p["start"]), p["heat"], p["cool"]) != wanted[p["period_id"]]]
-            raise PortalError(f"the portal did not keep the change for {len(off)} period(s): {off}")
+            off = [n for i, n in zip(items, now) if not kept(i, n)]
+            raise ClimateError(f"the Lennox portal did not keep the change for {len(off)} period(s): {off}")
         # A start time change can make the portal split "all days" into separate days: report what it is now.
         return out | {"days": after["days"], "periods": now, "changed": True}

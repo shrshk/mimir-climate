@@ -3,14 +3,16 @@ import json
 from fastapi.testclient import TestClient
 
 from mimir_climate.app import create_app, mcp_token
-from mimir_climate.portal import PortalError
+from mimir_climate.thermostats import ClimateError
 
 TOKEN = "t" * 43
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
 class FakeThermostats:
-    """Stands in for the maker's portal (the process edge): records changes, answers like the portal."""
+    """Stands in for a provider (the process edge): records changes, answers like one."""
+
+    closed = False
 
     def __init__(self):
         self.periods = {"upstairs": {0: [67, 80], 3: [66, 84]}}
@@ -21,7 +23,7 @@ class FakeThermostats:
 
     async def schedule(self, system):
         if system not in self.periods:
-            raise PortalError(f"no system {system!r}; the systems are upstairs")
+            raise ClimateError(f"no system {system!r}; the systems are upstairs")
         return {
             "system": system,
             "periods": [{"period_id": k, "heat": h, "cool": c} for k, (h, c) in self.periods[system].items()],
@@ -32,6 +34,9 @@ class FakeThermostats:
         p = self.periods[system][period_id]
         p[:] = [heat if heat is not None else p[0], cool if cool is not None else p[1]]
         return {"system": system, "period": {"period_id": period_id, "heat": p[0], "cool": p[1]}, "changed": True}
+
+    async def close(self):
+        self.closed = True
 
 
 def setup():
@@ -123,3 +128,10 @@ def test_every_day_is_passed_through_only_when_true():
     tool(c, "set_schedule_period", system="upstairs", period_id=0, start="8:00 am", every_day=True)
     tool(c, "set_schedule_period", system="upstairs", period_id=0, heat=71, every_day="yes")
     assert fake.changes == [("upstairs", 0, None, None, "8:00 am", "every day"), ("upstairs", 0, 71, None, None)]
+
+
+def test_the_provider_is_closed_when_the_server_stops():
+    fake = FakeThermostats()
+    with TestClient(create_app(fake, TOKEN)):
+        assert not fake.closed
+    assert fake.closed

@@ -15,17 +15,11 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI
 
-from mimir_climate.mcp_server import Thermostats, router
-from mimir_climate.portal import Portal
+from mimir_climate import providers
+from mimir_climate.mcp_server import router
+from mimir_climate.thermostats import Thermostats
 
-DEFAULTS: dict[str, Any] = {
-    "host": "127.0.0.1",
-    "port": 8725,
-    "systems": [],
-    "secret_command": ["op", "read"],
-    "username": "",
-    "password": "",
-}
+DEFAULTS: dict[str, Any] = {"host": "127.0.0.1", "port": 8725, "provider": "", "systems": []}
 
 
 def config_dir() -> Path:
@@ -34,10 +28,9 @@ def config_dir() -> Path:
 
 def load_settings(folder: Path) -> dict[str, Any]:
     path = folder / "settings.json"
-    cfg = DEFAULTS | (json.loads(path.read_text()) if path.exists() else {})
-    if not cfg["username"] or not cfg["password"]:
-        raise SystemExit(f"set username and password (secret store references) in {path}")
-    return cfg
+    if not path.exists():
+        raise SystemExit(f"copy settings.example.json to {path} and fill it in")
+    return DEFAULTS | json.loads(path.read_text())
 
 
 def mcp_token(path: Path) -> str:
@@ -56,9 +49,7 @@ def create_app(thermostats: Thermostats, token: str) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
-        close = getattr(thermostats, "close", None)
-        if close:
-            await close()
+        await thermostats.close()
 
     app = FastAPI(title="mimir-climate", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.include_router(router(thermostats, token))
@@ -69,6 +60,5 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     folder = config_dir()
     cfg = load_settings(folder)
-    portal = Portal(cfg["secret_command"], cfg["username"], cfg["password"], cfg["systems"])
-    app = create_app(portal, mcp_token(folder / "mcp-token"))
+    app = create_app(providers.load(cfg), mcp_token(folder / "mcp-token"))
     uvicorn.run(app, host=cfg["host"], port=cfg["port"], access_log=False)

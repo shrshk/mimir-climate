@@ -8,12 +8,12 @@ that came through a proxy.
 
 import hmac
 import json
-from typing import Any, Protocol
+from typing import Any
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
-from mimir_climate.portal import PortalError
+from mimir_climate.thermostats import ClimateError, Thermostats
 
 VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")  # newest first; the client's own is answered when known
 
@@ -21,16 +21,17 @@ TOOLS = [
     {
         "name": "status",
         "description": "Every thermostat now: system name, indoor temperature and humidity, whether it is heating, "
-        "cooling or idle, its mode (a schedule's name such as 'Schedule IQ', 'cool only', 'heat only', 'off', or "
-        "AWAY), and the setpoints it holds (heat_to: heat starts below it; cool_to: cooling starts above it). "
-        "Degrees Fahrenheit. Takes up to a minute.",
+        "cooling or idle, its mode (a schedule's name, or a mode such as 'cool only', 'heat only', 'off' or AWAY), "
+        "and the setpoints it holds (heat_to: heat starts below it; cool_to: cooling starts above it). In the unit "
+        "the thermostats use (schedule's limits.unit). Takes up to a minute.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "schedule",
-        "description": "A thermostat's schedule: its name and periods (period_id, start time, heat and cool "
-        "setpoints, fan), with the limits (heat and cool ranges, deadband: the least gap between heat and cool). "
-        "Not available while the system is in AWAY.",
+        "description": "A thermostat's schedule: its name, how it splits the week (days), its periods (period_id, "
+        "day, slot: its place in the day, start time, heat and cool setpoints, fan) and the limits (heat and cool "
+        "ranges, deadband: the least gap between heat and cool, unit, start_step in minutes). Some thermostats show "
+        "no schedule while in AWAY.",
         "inputSchema": {
             "type": "object",
             "properties": {"system": {"type": "string", "description": "a name from status, e.g. upstairs"}},
@@ -40,18 +41,19 @@ TOOLS = [
     {
         "name": "set_schedule_period",
         "description": "Change one schedule period on one thermostat: its start time, heat, cool, or any of them "
-        "(what is not given stays). A period runs from its start until the next period starts, so to change when "
-        "the night ends, change the start of the morning period. It applies to every day and is checked by reading "
-        "the schedule again. Changing a start time can make the portal split the schedule into seven separate days (period ids 0-27, four per day); then use every_day to change the same period on every day. Only when the person asks for the change. Takes up to two minutes.",
+        "(what is not given stays). A period runs from its start until the next period of its day starts, so to "
+        "change when the night ends, change the start of the morning period. When the schedule has separate days, "
+        "every_day changes the same slot on every day. Everything is checked before anything is sent, and the "
+        "change is read back. Only when the person asks for the change. Takes up to two minutes.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "system": {"type": "string"},
                 "period_id": {"type": "integer", "description": "from schedule"},
-                "start": {"type": "string", "description": "e.g. 9:30 pm or 21:30; quarter hours only"},
+                "start": {"type": "string", "description": "e.g. 9:30 pm or 21:30, on the schedule's start_step"},
                 "every_day": {
                     "type": "boolean",
-                    "description": "when the schedule has separate days: the same period on all seven days",
+                    "description": "the same slot on every day of the schedule",
                 },
                 "heat": {"type": "integer", "description": "heat starts below this"},
                 "cool": {"type": "integer", "description": "cooling starts above this"},
@@ -62,28 +64,12 @@ TOOLS = [
 ]
 
 
-class Thermostats(Protocol):
-    async def status(self) -> list[dict[str, Any]]: ...
-
-    async def schedule(self, system: str) -> dict[str, Any]: ...
-
-    async def set_period(
-        self,
-        system: str,
-        period_id: int,
-        heat: int | None,
-        cool: int | None,
-        start: str | None = None,
-        every_day: bool = False,
-    ) -> dict[str, Any]: ...
-
-
 def whole(args: dict, key: str) -> int | None:
     v = args.get(key)
     if v is None:
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v):
-        raise PortalError(f"{key} must be a whole number")
+        raise ClimateError(f"{key} must be a whole number")
     return int(v)
 
 
@@ -99,7 +85,7 @@ def router(thermostats: Thermostats, token: str) -> APIRouter:
         heat, cool = whole(args, "heat"), whole(args, "cool")
         start = str(args["start"]) if args.get("start") not in (None, "") else None
         if heat is None and cool is None and start is None:
-            raise PortalError("give start, heat, cool or any of them")
+            raise ClimateError("give start, heat, cool or any of them")
         every_day = args.get("every_day") is True
         return await thermostats.set_period(str(args["system"]), whole(args, "period_id"), heat, cool, start, every_day)
 
@@ -147,9 +133,9 @@ def router(thermostats: Thermostats, token: str) -> APIRouter:
             missing = [k for k in tool["inputSchema"].get("required", []) if args.get(k) in (None, "")]
             try:
                 if missing:
-                    raise PortalError(f"missing {', '.join(missing)}")
+                    raise ClimateError(f"missing {', '.join(missing)}")
                 result, failed = await run(name, args), False
-            except PortalError as e:
+            except ClimateError as e:
                 result, failed = str(e), True
             text = result if failed else json.dumps(result, ensure_ascii=False)
             return answer(id_, {"content": [{"type": "text", "text": text}], "isError": failed})

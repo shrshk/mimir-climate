@@ -21,9 +21,13 @@ if [ "${1:-}" = "--remove" ]; then
 fi
 [ -f "$CONFIG/settings.json" ] || { echo "first copy settings.example.json to $CONFIG/settings.json and fill it in" >&2; exit 1; }
 
-uv tool install --force --quiet "$REPO/service"
-# The headless browser that drives the portal, matching the installed Playwright.
-"$(uv tool dir)/mimir-climate/bin/python" -m playwright install chromium-headless-shell
+PROVIDER=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("provider",""))' "$CONFIG/settings.json")
+[ -n "$PROVIDER" ] || { echo "set provider in $CONFIG/settings.json (see settings.example.json)" >&2; exit 1; }
+uv tool install --force --quiet "$REPO/service[$PROVIDER]"
+case $PROVIDER in
+  # the headless browser that drives the Lennox web portal, matching the installed Playwright
+  lennox) "$(uv tool dir)/mimir-climate/bin/python" -m playwright install chromium-headless-shell ;;
+esac
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 touch "$HOME/Library/Logs/mimir-climate.log" && chmod 600 "$HOME/Library/Logs/mimir-climate.log"  # owner-only, like the settings
 cat > "$PLIST" <<EOF

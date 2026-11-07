@@ -1,8 +1,11 @@
 {
   "host": "127.0.0.1",
   "port": 8725,
+  "provider": "lennox",
   "systems": ["upstairs", "downstairs"],
-  "secret_command": ["op", "read"],
-  "username": "op://<vault>/<item>/username",
-  "password": "op://<vault>/<item>/password"
+  "lennox": {
+    "secret_command": ["op", "read"],
+    "username": "op://<vault>/<item>/username",
+    "password": "op://<vault>/<item>/password"
+  }
 }
