@@ -25,6 +25,7 @@ uv tool install --force --quiet "$REPO/service"
 # The headless browser that drives the portal, matching the installed Playwright.
 "$(uv tool dir)/mimir-climate/bin/python" -m playwright install chromium-headless-shell
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+touch "$HOME/Library/Logs/mimir-climate.log" && chmod 600 "$HOME/Library/Logs/mimir-climate.log"  # owner-only, like the settings
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -33,6 +34,7 @@ cat > "$PLIST" <<EOF
     <key>Label</key><string>$LABEL</string>
     <key>ProgramArguments</key><array><string>$HOME/.local/bin/mimir-climate</string></array>
     <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+    <key>Umask</key><integer>63</integer>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>$HOME/Library/Logs/mimir-climate.log</string>
