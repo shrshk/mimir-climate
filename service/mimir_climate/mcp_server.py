@@ -39,14 +39,20 @@ TOOLS = [
     },
     {
         "name": "set_schedule_period",
-        "description": "Change one schedule period's setpoints on one thermostat (give heat, cool or both; the other "
-        "stays). It applies to every day and is checked by reading the schedule again. Only when the person asks "
-        "for the change. Takes up to two minutes.",
+        "description": "Change one schedule period on one thermostat: its start time, heat, cool, or any of them "
+        "(what is not given stays). A period runs from its start until the next period starts, so to change when "
+        "the night ends, change the start of the morning period. It applies to every day and is checked by reading "
+        "the schedule again. Changing a start time can make the portal split the schedule into seven separate days (period ids 0-27, four per day); then use every_day to change the same period on every day. Only when the person asks for the change. Takes up to two minutes.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "system": {"type": "string"},
                 "period_id": {"type": "integer", "description": "from schedule"},
+                "start": {"type": "string", "description": "e.g. 9:30 pm or 21:30; quarter hours only"},
+                "every_day": {
+                    "type": "boolean",
+                    "description": "when the schedule has separate days: the same period on all seven days",
+                },
                 "heat": {"type": "integer", "description": "heat starts below this"},
                 "cool": {"type": "integer", "description": "cooling starts above this"},
             },
@@ -61,7 +67,15 @@ class Thermostats(Protocol):
 
     async def schedule(self, system: str) -> dict[str, Any]: ...
 
-    async def set_period(self, system: str, period_id: int, heat: int | None, cool: int | None) -> dict[str, Any]: ...
+    async def set_period(
+        self,
+        system: str,
+        period_id: int,
+        heat: int | None,
+        cool: int | None,
+        start: str | None = None,
+        every_day: bool = False,
+    ) -> dict[str, Any]: ...
 
 
 def whole(args: dict, key: str) -> int | None:
@@ -83,9 +97,11 @@ def router(thermostats: Thermostats, token: str) -> APIRouter:
             return await thermostats.schedule(str(args["system"]))
         # set_schedule_period
         heat, cool = whole(args, "heat"), whole(args, "cool")
-        if heat is None and cool is None:
-            raise PortalError("give heat, cool or both")
-        return await thermostats.set_period(str(args["system"]), whole(args, "period_id"), heat, cool)
+        start = str(args["start"]) if args.get("start") not in (None, "") else None
+        if heat is None and cool is None and start is None:
+            raise PortalError("give start, heat, cool or any of them")
+        every_day = args.get("every_day") is True
+        return await thermostats.set_period(str(args["system"]), whole(args, "period_id"), heat, cool, start, every_day)
 
     def answer(id_, result=None, error: tuple[int, str] | None = None) -> JSONResponse:
         body = {"jsonrpc": "2.0", "id": id_}

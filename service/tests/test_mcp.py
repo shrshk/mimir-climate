@@ -27,8 +27,8 @@ class FakeThermostats:
             "periods": [{"period_id": k, "heat": h, "cool": c} for k, (h, c) in self.periods[system].items()],
         }
 
-    async def set_period(self, system, period_id, heat, cool):
-        self.changes.append((system, period_id, heat, cool))
+    async def set_period(self, system, period_id, heat, cool, start=None, every_day=False):
+        self.changes.append((system, period_id, heat, cool, start) + (("every day",) if every_day else ()))
         p = self.periods[system][period_id]
         p[:] = [heat if heat is not None else p[0], cool if cool is not None else p[1]]
         return {"system": system, "period": {"period_id": period_id, "heat": p[0], "cool": p[1]}, "changed": True}
@@ -84,20 +84,20 @@ def test_setting_one_setpoint_keeps_the_other():
     c, fake = setup()
     got, failed = tool(c, "set_schedule_period", system="upstairs", period_id=0, heat=72)
     assert not failed
-    assert fake.changes == [("upstairs", 0, 72, None)]
+    assert fake.changes == [("upstairs", 0, 72, None, None)]
     assert got["period"] == {"period_id": 0, "heat": 72, "cool": 80}
 
 
 def test_period_zero_counts_as_given():
     c, fake = setup()
     _, failed = tool(c, "set_schedule_period", system="upstairs", period_id=0, cool=82)
-    assert not failed and fake.changes == [("upstairs", 0, None, 82)]
+    assert not failed and fake.changes == [("upstairs", 0, None, 82, None)]
 
 
 def test_a_change_without_setpoints_or_with_a_fraction_is_refused_before_the_portal():
     c, fake = setup()
     text, failed = tool(c, "set_schedule_period", system="upstairs", period_id=0)
-    assert failed and "give heat, cool or both" in text
+    assert failed and "give start, heat, cool or any of them" in text
     text, failed = tool(c, "set_schedule_period", system="upstairs", period_id=0, heat=71.5)
     assert failed and "whole number" in text
     text, failed = tool(c, "set_schedule_period", system="upstairs", heat=72)
@@ -110,3 +110,16 @@ def test_the_token_is_made_once_and_kept_private(tmp_path):
     first = mcp_token(path)
     assert len(first) >= 40 and mcp_token(path) == first
     assert path.stat().st_mode & 0o077 == 0
+
+
+def test_a_start_time_alone_is_passed_through():
+    c, fake = setup()
+    _, failed = tool(c, "set_schedule_period", system="upstairs", period_id=3, start="9:30 pm")
+    assert not failed and fake.changes == [("upstairs", 3, None, None, "9:30 pm")]
+
+
+def test_every_day_is_passed_through_only_when_true():
+    c, fake = setup()
+    tool(c, "set_schedule_period", system="upstairs", period_id=0, start="8:00 am", every_day=True)
+    tool(c, "set_schedule_period", system="upstairs", period_id=0, heat=71, every_day="yes")
+    assert fake.changes == [("upstairs", 0, None, None, "8:00 am", "every day"), ("upstairs", 0, 71, None, None)]

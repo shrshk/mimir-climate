@@ -25,7 +25,7 @@ TILES = ".bxslider.HomeZones > *:not(.bx-clone)"
 WAIT_MS = 45_000
 NAV_MS = 90_000
 READ_BACK_WAITS = (2, 15, 30)  # seconds before each check that a change was kept
-ALL_DAYS = "ALL_SEVEN_DAYS"
+PER_DAY = 4  # periods per day: ids 0-3 for "all days", or 0-27 for seven separate days
 
 log = logging.getLogger("mimir_climate")
 
@@ -93,6 +93,44 @@ def check_setpoints(heat: int, cool: int, limits: dict[str, Any]) -> None:
         raise PortalError(f"cool must be at least {limits['deadband']} above heat (asked heat {heat}, cool {cool})")
 
 
+TIME = re.compile(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?\s*$", re.IGNORECASE)
+
+
+def minutes(time: str) -> int:
+    """'07:00 am', '9:30 pm', '9:30pm', '21:30' or '8 am' to minutes after midnight."""
+    m = TIME.match(time)
+    if not m:
+        raise PortalError(f"could not read the time {time!r}; give it like 9:30 pm or 21:30")
+    hour, minute, half = int(m[1]), int(m[2] or 0), (m[3] or "").lower()
+    if minute > 59 or hour > 23 or (half and not 1 <= hour <= 12):
+        raise PortalError(f"{time!r} is not a time of day")
+    if half:
+        hour = hour % 12 + (12 if half == "p" else 0)
+    return hour * 60 + minute
+
+
+def portal_time(mins: int) -> str:
+    """Minutes after midnight as the portal writes a start time: '09:30 pm'."""
+    hour, minute = divmod(mins, 60)
+    return f"{(hour % 12) or 12:02d}:{minute:02d} {'pm' if hour >= 12 else 'am'}"
+
+
+def check_start(start: str, period_id: int, periods: list[dict[str, Any]]) -> str:
+    """A new start time in the portal's form. Refused unless it is on a quarter hour (as the thermostat sets them)
+    and stays after the period before it and before the period after it (the periods run in order through the day)."""
+    mins = minutes(start)
+    if mins % 15:
+        raise PortalError("start times go in steps of 15 minutes (:00, :15, :30, :45)")
+    day = period_id // PER_DAY  # neighbours only within the same day
+    order = sorted((p for p in periods if p["period_id"] // PER_DAY == day), key=lambda p: p["period_id"])
+    i = next(i for i, p in enumerate(order) if p["period_id"] == period_id)
+    if i > 0 and mins <= minutes(order[i - 1]["start"]):
+        raise PortalError(f"must start after the period before it ({order[i - 1]['start']})")
+    if i + 1 < len(order) and mins >= minutes(order[i + 1]["start"]):
+        raise PortalError(f"must start before the period after it ({order[i + 1]['start']})")
+    return portal_time(mins)
+
+
 def system_names(count: int, names: Sequence[str]) -> list[str]:
     """The portal's tiles in order, named from the settings ("system 3" for a tile without a name)."""
     return [names[i] if i < len(names) else f"system {i + 1}" for i in range(count)]
@@ -124,8 +162,16 @@ class Portal:
     async def schedule(self, system: str) -> dict[str, Any]:
         return await self._run(self._schedule, system)
 
-    async def set_period(self, system: str, period_id: int, heat: int | None, cool: int | None) -> dict[str, Any]:
-        return await self._run(self._set_period, system, period_id, heat, cool)
+    async def set_period(
+        self,
+        system: str,
+        period_id: int,
+        heat: int | None,
+        cool: int | None,
+        start: str | None = None,
+        every_day: bool = False,
+    ) -> dict[str, Any]:
+        return await self._run(self._set_period, system, period_id, heat, cool, start, every_day)
 
     async def close(self) -> None:
         try:
@@ -241,37 +287,55 @@ class Portal:
         return {"system": system} | await self._open_editor(pg, system)
 
     async def _set_period(
-        self, pg: Page, system: str, period_id: int, heat: int | None, cool: int | None
+        self,
+        pg: Page,
+        system: str,
+        period_id: int,
+        heat: int | None,
+        cool: int | None,
+        start: str | None = None,
+        every_day: bool = False,
     ) -> dict[str, Any]:
         before = await self._open_editor(pg, system)
-        if before["days"] != ALL_DAYS:
-            raise PortalError(f"{system}'s schedule has separate days ({before['days']}); change it on the thermostat")
-        was = find_period(before, period_id)
-        heat = was["heat"] if heat is None else heat
-        cool = was["cool"] if cool is None else cool
-        check_setpoints(heat, cool, before["limits"])
-        out = {"system": system, "schedule": before["schedule"], "before": {"heat": was["heat"], "cool": was["cool"]}}
-        if (heat, cool) == (was["heat"], was["cool"]):
-            return out | {"period": was, "changed": False}
-        body = {
-            "scheduleId": before["schedule_id"],
-            "isPeriodUpdated": True,
-            "periodUpdateConfig": {
-                "periodID": period_id,
-                "isSetPointsUpdated": True,
-                "csp": cool,
-                "hsp": heat,
-                "isSSPOn": False,
-            },
-            "CurrentDaysMode": ALL_DAYS,
-        }
-        if await pg.evaluate(SAVE_JS, body) != "success":
-            raise PortalError("the portal refused the change")
+        find_period(before, period_id)
+        targets = (
+            [p["period_id"] for p in before["periods"] if p["period_id"] % PER_DAY == period_id % PER_DAY]
+            if every_day
+            else [period_id]
+        )
+        wanted, saves = {}, []
+        for pid in targets:  # check every period first: nothing is sent unless all of them fit
+            was = find_period(before, pid)
+            h = was["heat"] if heat is None else heat
+            c = was["cool"] if cool is None else cool
+            check_setpoints(h, c, before["limits"])
+            s = was["start"] if start is None else check_start(start, pid, before["periods"])
+            wanted[pid] = (minutes(s), h, c)
+            if minutes(s) != minutes(was["start"]):
+                saves.append({"periodID": pid, "isStartTimeUpdated": True, "startTime": s})
+            if (h, c) != (was["heat"], was["cool"]):
+                saves.append({"periodID": pid, "isSetPointsUpdated": True, "csp": c, "hsp": h, "isSSPOn": False})
+        out = {"system": system, "schedule": before["schedule"], "days": before["days"]}
+        out["before"] = [find_period(before, pid) for pid in targets]
+        if not saves:
+            return out | {"periods": out.pop("before"), "changed": False}
+        for change in saves:
+            body = {
+                "scheduleId": before["schedule_id"],
+                "isPeriodUpdated": True,
+                "periodUpdateConfig": change,
+                "CurrentDaysMode": before["days"],
+            }
+            if await pg.evaluate(SAVE_JS, body) != "success":
+                raise PortalError("the portal refused the change")
         for wait in READ_BACK_WAITS:  # read back on a fresh page; the portal can take a little while to show it
             await asyncio.sleep(wait)
-            now = find_period(await self._open_editor(pg, system), period_id)
-            if (now["heat"], now["cool"]) == (heat, cool):
+            after = await self._open_editor(pg, system)
+            now = [find_period(after, pid) for pid in targets]
+            if all((minutes(p["start"]), p["heat"], p["cool"]) == wanted[p["period_id"]] for p in now):
                 break
         else:
-            raise PortalError(f"the portal kept heat {now['heat']} / cool {now['cool']} instead")
-        return out | {"period": now, "changed": True}
+            off = [p for p in now if (minutes(p["start"]), p["heat"], p["cool"]) != wanted[p["period_id"]]]
+            raise PortalError(f"the portal did not keep the change for {len(off)} period(s): {off}")
+        # A start time change can make the portal split "all days" into separate days: report what it is now.
+        return out | {"days": after["days"], "periods": now, "changed": True}

@@ -1,6 +1,14 @@
 import pytest
 
-from mimir_climate.portal import PortalError, check_setpoints, find_period, parse_status, system_names
+from mimir_climate.portal import (
+    PortalError,
+    check_setpoints,
+    check_start,
+    find_period,
+    minutes,
+    parse_status,
+    system_names,
+)
 
 LIMITS = {"heat": [60, 90], "cool": [60, 90], "deadband": 3, "unit": "F"}
 
@@ -72,3 +80,54 @@ def test_an_unknown_period_names_the_real_ones():
     assert find_period(schedule, 3) == {"period_id": 3}
     with pytest.raises(PortalError, match="the periods are 0, 3"):
         find_period(schedule, 1)
+
+
+@pytest.mark.parametrize(
+    "text,mins",
+    [
+        ("07:00 am", 420),
+        ("9:30 pm", 1290),
+        ("9:30pm", 1290),
+        ("21:30", 1290),
+        ("8 am", 480),
+        ("12:00 am", 0),
+        ("12:15 pm", 735),
+        ("9:30 P.M.", 1290),
+    ],
+)
+def test_times_people_and_the_portal_write(text, mins):
+    assert minutes(text) == mins
+
+
+@pytest.mark.parametrize("text", ["25:00", "13:00 pm", "9:75", "noon", ""])
+def test_times_that_are_not_times(text):
+    with pytest.raises(PortalError):
+        minutes(text)
+
+
+DAY_NIGHT = [{"period_id": 0, "start": "07:00 am"}, {"period_id": 3, "start": "11:00 pm"}]
+
+
+def test_a_new_start_is_written_the_portals_way():
+    assert check_start("21:30", 3, DAY_NIGHT) == "09:30 pm"
+    assert check_start("8:00 am", 0, DAY_NIGHT) == "08:00 am"
+
+
+@pytest.mark.parametrize(
+    "start,pid,why",
+    [
+        ("9:40 pm", 3, "steps of 15"),
+        ("6:30 am", 3, "after the period before"),
+        ("11:30 pm", 0, "before the period after"),
+    ],
+)
+def test_a_start_out_of_order_or_off_the_quarter_hour_is_refused(start, pid, why):
+    with pytest.raises(PortalError, match=why):
+        check_start(start, pid, DAY_NIGHT)
+
+
+def test_with_separate_days_a_start_is_checked_against_its_own_day_only():
+    week = [{"period_id": d * 4 + k, "start": t} for d in range(7) for k, t in ((0, "07:00 am"), (3, "09:30 pm"))]
+    assert check_start("8:00 am", 4, week) == "08:00 am"  # day 1's morning, not day 0's night
+    with pytest.raises(PortalError, match="before the period after"):
+        check_start("10:00 pm", 4, week)
