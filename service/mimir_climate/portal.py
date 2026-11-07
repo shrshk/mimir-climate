@@ -24,6 +24,7 @@ BASE = "https://www.lennoxicomfort.com"
 TILES = ".bxslider.HomeZones > *:not(.bx-clone)"
 WAIT_MS = 45_000
 NAV_MS = 90_000
+READ_BACK_WAITS = (2, 15, 30)  # seconds before each check that a change was kept
 ALL_DAYS = "ALL_SEVEN_DAYS"
 
 log = logging.getLogger("mimir_climate")
@@ -266,7 +267,11 @@ class Portal:
         }
         if await pg.evaluate(SAVE_JS, body) != "success":
             raise PortalError("the portal refused the change")
-        now = find_period(await self._open_editor(pg, system), period_id)  # read back on a fresh page
-        if (now["heat"], now["cool"]) != (heat, cool):
+        for wait in READ_BACK_WAITS:  # read back on a fresh page; the portal can take a little while to show it
+            await asyncio.sleep(wait)
+            now = find_period(await self._open_editor(pg, system), period_id)
+            if (now["heat"], now["cool"]) == (heat, cool):
+                break
+        else:
             raise PortalError(f"the portal kept heat {now['heat']} / cool {now['cool']} instead")
         return out | {"period": now, "changed": True}
